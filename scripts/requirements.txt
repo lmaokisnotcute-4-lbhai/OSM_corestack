@@ -1,0 +1,6 @@
+earthengine-api
+geopandas
+requests
+shapely
+pandas
+python-dotenv
