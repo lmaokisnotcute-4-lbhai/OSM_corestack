@@ -53,14 +53,18 @@ var ws = ee.FeatureCollection(
 print(ws.limit(10));
 Map.addLayer(ws);
 ```
+## To create wiki pages
 
+```bash
+python create_wikipages.py --watershed_id C2AGAN72 --geojson C2AGAN72_microwatersheds.geojson
+```
 
 ## To push metatdata of extracted microwatersheds onto OSM
 
 ```bash
 python geomsimplify.py
 ```
-## this will create a simplified.geojson used as input in next file
+This will create a simplified.geojson used as input in the next program.
 ```bash
 python osm_auth.py
 ```
