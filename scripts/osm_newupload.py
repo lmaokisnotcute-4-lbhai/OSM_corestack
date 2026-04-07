@@ -127,7 +127,6 @@ for i in range(0, len(features), batch_size):
   <member type="way" ref="{way_id}" role="outer"/>
 
   <tag k="type" v="boundary"/>
-  <tag k="boundary" v="watershed"/>
 
   <tag k="core_entity" v="microwatershed"/>
   <tag k="core_id" v="{uid}"/>
