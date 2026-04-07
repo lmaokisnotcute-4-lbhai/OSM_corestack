@@ -4,3 +4,4 @@ requests
 shapely
 pandas
 python-dotenv
+mwclient
