@@ -1,6 +1,5 @@
-# CoREStack Microwatershed Pipeline
-
-Fetch all microwatersheds within a watershed, with water balance properties (DeltaG, ET, Precipitation, RunOff, Groundwater, WellDepth), as a single GeoJSON file.
+# CoREStack to OSM upload Pipeline
+This repository contains the automated pipeline to extract microwatershed boundaries and water balance data from CoREStack and publish them to OpenStreetMap and the OSM Wiki.
 
 ## Prerequisites
 
