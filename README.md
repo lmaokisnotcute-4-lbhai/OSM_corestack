@@ -14,6 +14,7 @@ Fetch all microwatersheds within a watershed, with water balance properties (Del
 # 1. Clone and enter the repo
 git clone https://github.com/your-username/your-repo-name.git
 cd your-repo-name
+cd scripts
 
 # 2. Create and activate a virtual environment
 python3 -m venv venv
