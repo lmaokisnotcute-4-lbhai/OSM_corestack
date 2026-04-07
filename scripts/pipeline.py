@@ -347,6 +347,11 @@ def get_microwatersheds_pipeline(watershed_id: str, output_filename: str,
         else:
             print(f"   ⚠️  No water balance data for {t} — geometry only.")
 
+        # Stamp admin fields onto every MWS row — needed for the report API
+        gdf["state"]    = entry["state"]
+        gdf["district"] = entry["district"]
+        gdf["tehsil"]   = entry["tehsil"]
+
         all_gdfs.append(gdf)
 
     if not all_gdfs:

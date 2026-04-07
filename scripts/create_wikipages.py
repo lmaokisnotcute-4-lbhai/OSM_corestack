@@ -13,12 +13,13 @@ Usage:
     python create_wiki_pages.py --watershed_id C2AGAN72 --geojson C2AGAN72_microwatersheds.geojson
 
 Credentials are read from environment variables (or .env file):
-    WIKI_USER       your OSM wiki username  e.g. Sweek10
-    WIKI_BOT_NAME   your bot name           e.g. core_osm
-    WIKI_BOT_PASS   your bot password
+    WIKI_USER           your OSM wiki username  e.g. Sweek10
+    WIKI_BOT_NAME       your bot name           e.g. core_osm
+    WIKI_BOT_PASS       your bot password
+    CORESTACK_API_KEY   your CoREStack API key
 
 Requirements:
-    pip install mwclient python-dotenv
+    pip install mwclient python-dotenv requests
 """
 
 import argparse
@@ -29,11 +30,16 @@ import re
 import time
 
 import mwclient
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-WIKI_HOST = "wiki.openstreetmap.org"
+WIKI_HOST       = "wiki.openstreetmap.org"
+BASE_URL        = "https://geoserver.core-stack.org/api/v1/"
+REPORT_ENDPOINT = "get_mws_report/"
+
+METRICS = ["Precipitation", "RunOff", "ET", "DeltaG", "G", "WellDepth"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -54,32 +60,50 @@ def parse_wsconc(wsconc: str) -> tuple[str, str]:
 
 def get_yearly_metrics(props: dict) -> dict[str, dict]:
     """
-    Extract all yearly water balance entries from a feature's properties.
-    Keys shaped like '2017_2018' with JSON string or dict values.
-    Returns { '2017_2018': {DeltaG, ET, Precipitation, RunOff, G, WellDepth}, ... }
+    Reconstruct yearly water balance dicts from the flat GeoJSON columns.
+
+    The GeoJSON from pipeline.py stores data as flat columns:
+        DeltaG_2017_2018, ET_2017_2018, Precipitation_2017_2018, ...
+
+    This function groups them back into:
+        { '2017_2018': {'DeltaG': ..., 'ET': ..., ...}, ... }
+
     sorted chronologically.
     """
     yearly = {}
+
     for key, value in props.items():
-        if not (isinstance(key, str) and "_" in key and key.replace("_", "").isdigit()):
+        # Match pattern: MetricName_YYYY_YYYY  e.g. DeltaG_2017_2018
+        m = re.match(r'^([A-Za-z]+)_(\d{4}_\d{4})$', key)
+        if not m:
             continue
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except Exception:
-                continue
-        if not isinstance(value, dict):
+        metric    = m.group(1)   # e.g. "DeltaG"
+        year_key  = m.group(2)   # e.g. "2017_2018"
+
+        if metric not in METRICS:
             continue
-        yearly[key] = value
-    return dict(sorted(yearly.items()))
+
+        if year_key not in yearly:
+            yearly[year_key] = {}
+        yearly[year_key][metric] = value
+
+    return dict(sorted(yearly.items()))  # chronological order
 
 
-def fmt(val, decimals=2) -> str:
-    """Format a metric value for display."""
+def get_most_recent_year(yearly: dict) -> tuple[str, dict] | tuple[None, None]:
+    """Return (year_key, metrics) for the most recent year, or (None, None)."""
+    if not yearly:
+        return None, None
+    most_recent = sorted(yearly.keys())[-1]
+    return most_recent, yearly[most_recent]
+
+
+def fmt(val) -> str:
+    """Format a metric value to 2 decimal places."""
     if val is None or val == "N/A":
         return "N/A"
     try:
-        return f"{float(val):.{decimals}f}"
+        return f"{float(val):.2f}"
     except (TypeError, ValueError):
         return str(val)
 
@@ -90,26 +114,63 @@ def format_year_label(key: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CoREStack MWS Report API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_mws_report_url(props: dict, api_key: str) -> str | None:
+    """
+    Call get_mws_report/ API and return the report URL or None.
+    Reads state, district, tehsil, mws_id from GeoJSON feature properties.
+    """
+    state    = props.get("state")    or props.get("STATE")    or props.get("State")
+    district = props.get("district") or props.get("District") or props.get("DISTRICT")
+    tehsil   = props.get("tehsil")   or props.get("Tehsil")   or props.get("TEHSIL")
+    mws_id   = props.get("uid")      or props.get("mws_id")   or props.get("id")
+
+    if not all([state, district, tehsil, mws_id]):
+        return None
+
+    params  = {"state": state, "district": district, "tehsil": tehsil, "mws_id": str(mws_id)}
+    headers = {"X-API-Key": api_key}
+
+    try:
+        resp = requests.get(BASE_URL + REPORT_ENDPOINT, params=params,
+                            headers=headers, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and data:
+                return data[0].get("Mws_report_url")
+            if isinstance(data, dict):
+                return data.get("Mws_report_url")
+    except Exception as e:
+        print(f"   ⚠️  Report API error for {mws_id}: {e}")
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Wiki page content builders
 # ─────────────────────────────────────────────────────────────────────────────
 
-METRICS = ["Precipitation", "RunOff", "ET", "DeltaG", "G", "WellDepth"]
-
-
-def build_mws_page(uid: str, props: dict, watershed_id: str) -> str:
+def build_mws_page(uid: str, props: dict, watershed_id: str,
+                   report_url: str | None) -> str:
     """
     Build wikitext for a single MWS page.
 
     Layout:
       == Micro-Watershed: <uid> ==
-      Overview table (Area, Parent Watershed)
+      Overview table: MWS ID, Parent Watershed, Area, CoREStack Report
 
-      === Water Balance Metrics ===
-      One combined table: Year | Precipitation | RunOff | ET | DeltaG | G | WellDepth
+      === Most Recent Water Balance (YYYY–YYYY) ===
+      Table with the latest year's metrics
+
+      === Full Water Balance History ===
+      Sortable table with all years
     """
     ws_page = f"CoREStack/Watershed/{watershed_id}"
     area    = props.get("area_in_ha", props.get("area", "N/A"))
     yearly  = get_yearly_metrics(props)
+    recent_year, recent_metrics = get_most_recent_year(yearly)
 
     lines = []
 
@@ -125,29 +186,47 @@ def build_mws_page(uid: str, props: dict, watershed_id: str) -> str:
     lines.append("|-")
     lines.append(f"| '''Parent Watershed''' || [[{ws_page}|{watershed_id}]]")
     lines.append("|-")
-    lines.append(f"| '''Area (ha)''' || {fmt(area, 2)}")
+    lines.append(f"| '''Area (ha)''' || {fmt(area)}")
+    lines.append("|-")
+    if report_url:
+        lines.append(f"| '''CoREStack Report''' || [{report_url} View Full Report »]")
+    else:
+        lines.append("| '''CoREStack Report''' || ''Not available''")
     lines.append("|}")
     lines.append("")
 
-    # ── Water balance table ──────────────────────────────────────
-    lines.append("=== Water Balance Metrics ===")
-    lines.append("All values in mm unless stated otherwise.")
-    lines.append("")
-
-    if not yearly:
-        lines.append("''No water balance data available for this microwatershed.''")
-    else:
-        # Single table with one row per year
-        lines.append('{| class="wikitable sortable"')
-        lines.append("! Year !! Precipitation (mm) !! RunOff (mm) !! ET (mm) !! DeltaG (mm) !! G (mm) !! WellDepth (m)")
-
-        for year_key, metrics in yearly.items():
-            label = format_year_label(year_key)
+    # ── Most recent year summary ──────────────────────────────────
+    if recent_year and recent_metrics:
+        lines.append(f"=== Hydrological Properties ({format_year_label(recent_year)}) ===")
+        lines.append("")
+        lines.append('{| class="wikitable"')
+        lines.append("! Metric !! Value")
+        for metric in METRICS:
+            val = fmt(recent_metrics.get(metric))
+            unit = "(m)" if metric == "WellDepth" else "(mm)"
             lines.append("|-")
-            row_vals = " || ".join(fmt(metrics.get(m)) for m in METRICS)
-            lines.append(f"| {label} || {row_vals}")
-
+            lines.append(f"| '''{metric} {unit}''' || {val}")
         lines.append("|}")
+        lines.append("")
+
+    # # ── Full history table ────────────────────────────────────────
+    # lines.append("=== Full Water Balance History ===")
+    # lines.append("All values in mm unless stated otherwise.")
+    # lines.append("")
+
+    # if not yearly:
+    #     lines.append("''No water balance data available for this microwatershed.''")
+    # else:
+    #     lines.append('{| class="wikitable sortable"')
+    #     lines.append("! Year !! Precipitation (mm) !! RunOff (mm) !! ET (mm) !! DeltaG (mm) !! G (mm) !! WellDepth (m)")
+
+    #     for year_key, metrics in yearly.items():
+    #         label    = format_year_label(year_key)
+    #         row_vals = " || ".join(fmt(metrics.get(m)) for m in METRICS)
+    #         lines.append("|-")
+    #         lines.append(f"| {label} || {row_vals}")
+
+    #     lines.append("|}")
 
     lines.append("")
     lines.append("----")
@@ -158,23 +237,11 @@ def build_mws_page(uid: str, props: dict, watershed_id: str) -> str:
 
 def build_watershed_page(watershed_id: str, sub_basin: str, ws_code: str,
                           mws_uids: list[str]) -> str:
-    """
-    Build wikitext for the watershed summary page.
-
-    Layout:
-      == Watershed Properties ==
-      Properties table (Sub Basin Code, Watershed Code)
-
-      == Micro-Watershed (MWS) Directory ==
-      Sortable table: MWS Unique ID | Registry Link
-    """
+    """Build wikitext for the watershed summary page."""
     lines = []
 
-    # ── Title ────────────────────────────────────────────────────
     lines.append(f"== Watershed Properties: {ws_code} ==")
     lines.append("")
-
-    # ── Properties table ─────────────────────────────────────────
     lines.append('{| class="wikitable"')
     lines.append("! Property !! Value")
     lines.append("|-")
@@ -188,7 +255,6 @@ def build_watershed_page(watershed_id: str, sub_basin: str, ws_code: str,
     lines.append("|}")
     lines.append("")
 
-    # ── MWS directory table ──────────────────────────────────────
     lines.append("== Micro-Watershed (MWS) Directory ==")
     lines.append("")
     lines.append('{| class="wikitable sortable"')
@@ -222,7 +288,7 @@ def save_page(site: mwclient.Site, title: str, content: str, summary: str):
     page = site.pages[title]
     page.save(content, summary=summary)
     print(f"   ✅ Saved: {title}")
-    time.sleep(0.5)  # be polite to the wiki server
+    time.sleep(0.5)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -230,7 +296,6 @@ def save_page(site: mwclient.Site, title: str, content: str, summary: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run(watershed_id: str, geojson_path: str):
-    # ── Load GeoJSON ─────────────────────────────────────────────
     print(f"\nLoading GeoJSON: {geojson_path}")
     with open(geojson_path, "r") as f:
         geojson = json.load(f)
@@ -241,25 +306,24 @@ def run(watershed_id: str, geojson_path: str):
         sys.exit(1)
     print(f"   {len(features)} MWS features loaded.")
 
-    # ── Parse watershed metadata from wsconc ─────────────────────
     sub_basin, ws_code = parse_wsconc(watershed_id)
     print(f"   Sub Basin Code: {sub_basin}   Watershed Code: {ws_code}")
 
-    # ── Wiki credentials from env ─────────────────────────────────
     wiki_user     = os.environ.get("WIKI_USER", "")
     wiki_bot_name = os.environ.get("WIKI_BOT_NAME", "")
     wiki_bot_pass = os.environ.get("WIKI_BOT_PASS", "")
+    api_key       = os.environ.get("CORESTACK_API_KEY", "")
 
     if not all([wiki_user, wiki_bot_name, wiki_bot_pass]):
-        print("❌ Wiki credentials not set. Add to .env:")
-        print("   WIKI_USER=your_username")
-        print("   WIKI_BOT_NAME=your_bot_name")
-        print("   WIKI_BOT_PASS=your_bot_password")
+        print("❌ Wiki credentials not set. Add WIKI_USER, WIKI_BOT_NAME, WIKI_BOT_PASS to .env")
         sys.exit(1)
+
+    if not api_key:
+        print("⚠️  CORESTACK_API_KEY not set — report URLs will show as 'Not available'.")
 
     site = login_wiki(wiki_user, wiki_bot_name, wiki_bot_pass)
 
-    # ── Phase 1: Create individual MWS pages ─────────────────────
+    # ── Phase 1: MWS pages ────────────────────────────────────────
     print(f"\n── Phase 1: Creating {len(features)} MWS wiki pages ──")
     mws_uids = []
 
@@ -267,11 +331,8 @@ def run(watershed_id: str, geojson_path: str):
         props = feature.get("properties", {})
 
         uid = (
-            props.get("uid")
-            or props.get("mws_id")
-            or props.get("MWS_ID")
-            or props.get("id")
-            or props.get("objectid")
+            props.get("uid") or props.get("mws_id") or props.get("MWS_ID")
+            or props.get("id") or props.get("objectid")
         )
         if uid is None:
             print(f"   ⚠️  Feature {i} has no UID, skipping.")
@@ -279,17 +340,25 @@ def run(watershed_id: str, geojson_path: str):
 
         uid = str(uid)
         mws_uids.append(uid)
+
+        report_url = None
+        if api_key:
+            report_url = fetch_mws_report_url(props, api_key)
+            status = "✅ report found" if report_url else "⚠️  no report"
+        else:
+            status = "⚠️  no API key"
+
         title   = f"CoREStack/MWS/{uid}"
-        content = build_mws_page(uid, props, watershed_id)
+        content = build_mws_page(uid, props, watershed_id, report_url)
         summary = f"Bot: Creating MWS page for {uid} under watershed {watershed_id}"
 
-        print(f"  [{i}/{len(features)}] {title}")
+        print(f"  [{i}/{len(features)}] {title} — {status}")
         try:
             save_page(site, title, content, summary)
         except Exception as e:
             print(f"   ⚠️  Failed to save {title}: {e}")
 
-    # ── Phase 2: Create / update watershed summary page ──────────
+    # ── Phase 2: Watershed page ───────────────────────────────────
     print(f"\n── Phase 2: Creating watershed summary page ──")
     ws_title   = f"CoREStack/Watershed/{watershed_id}"
     ws_content = build_watershed_page(watershed_id, sub_basin, ws_code, mws_uids)
@@ -317,9 +386,10 @@ Example:
   python create_wiki_pages.py --watershed_id C2AGAN72 --geojson C2AGAN72_microwatersheds.geojson
 
 Environment variables (add to .env):
-  WIKI_USER       your OSM wiki username
-  WIKI_BOT_NAME   your bot name
-  WIKI_BOT_PASS   your bot password
+  WIKI_USER             your OSM wiki username
+  WIKI_BOT_NAME         your bot name
+  WIKI_BOT_PASS         your bot password
+  CORESTACK_API_KEY     your CoREStack API key (for report URLs)
         """
     )
     parser.add_argument("--watershed_id", required=True,
